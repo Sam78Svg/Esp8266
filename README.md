@@ -215,6 +215,11 @@ Edit the Wi-Fi credentials in `src/main.cpp`:
 ```cpp
 const char *WIFI_SSID = "YOUR_WIFI_NAME";
 const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+IF USING MULTIPE WIFI SETUP
+
+const char *HOTSPOT_SSID = "MOBILE_HOSPOT_SSID";
+const char *HOTSPOT_PASSWORD = "MOBILE_HOSPOT_PASSWORD";
 ```
 
 ### 3. Configure the Static IP
@@ -419,6 +424,14 @@ Use:
 ```cpp
 const char *WIFI_SSID = "YOUR_WIFI_NAME";
 const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+IF WNAT TOT USE MULTIPLE WIFIES
+
+const char *HOTSPOT_SSID = "MOBILE_HOSPOT_SSID";
+const char *HOTSPOT_PASSWORD = "MOBILE_HOSPOT_PASSWORD";
+
+Note: Esp8266 use a 2.4Ghz wifi so swith mobile hotspot to 2.4Ghz to connect
+
 ```
 
 If real credentials have already been pushed to a public repository, change the Wi-Fi password.

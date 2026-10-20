@@ -19,6 +19,7 @@ const char *HOTSPOT_PASSWORD = "Nana@8805";
 const uint8_t WIFI_LED_PIN = LED_BUILTIN;
 
 // ============================================================
+// IN MY CASEE
 // NETWORK SETTINGS
 // Router: 192.168.31.1
 // ESP8266: 192.168.31.50
