@@ -2,22 +2,30 @@
 #include <ESP8266WiFi.h>
 #include <WiFiUdp.h>
 #include <ESP8266WebServer.h>
+#include <LittleFS.h>
 
 // ============================================================
 // WIFI SETTINGS
 // ============================================================
 
-const char *WIFI_SSID = "YOUR_WIFI_NAME";
-const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char *ROUTER_SSID = "HomeRouter";
+const char *ROUTER_PASSWORD = "Nana@8805";
+
+// Replace these two values with your mobile hotspot details.
+const char *HOTSPOT_SSID = "moto g86";
+const char *HOTSPOT_PASSWORD = "Nana@8805";
+
+// The NodeMCU built-in LED is active-low.
+const uint8_t WIFI_LED_PIN = LED_BUILTIN;
 
 // ============================================================
 // NETWORK SETTINGS
-// Router: 192.168.0.1
-// ESP8266: 192.168.0.50
+// Router: 192.168.31.1
+// ESP8266: 192.168.31.50
 // ============================================================
 
-IPAddress localIP(192, 168, 0, 50);
-IPAddress gateway(192, 168, 0, 1);
+IPAddress localIP(192, 168, 31, 50);
+IPAddress gateway(192, 168, 31, 1);
 IPAddress subnet(255, 255, 255, 0);
 
 // DNS servers used by ESP8266 itself
@@ -51,10 +59,89 @@ ESP8266WebServer server(80);
 // ============================================================
 
 #define MAX_BLOCKED_DOMAINS 150
+#define CUSTOM_BLOCKLIST_FILE "/custom_blocks.txt"
 
 String blocklist[MAX_BLOCKED_DOMAINS];
 
 int blockCount = 0;
+bool loadingCustomBlocklist = false;
+
+bool addBlockedDomain(String domain);
+
+bool saveCustomBlocklist()
+{
+    if (loadingCustomBlocklist)
+    {
+        return true;
+    }
+
+    File file = LittleFS.open(
+        CUSTOM_BLOCKLIST_FILE,
+        "w");
+
+    if (!file)
+    {
+        Serial.println(
+            "ERROR: Could not save custom blocklist");
+        return false;
+    }
+
+    for (int i = 0; i < blockCount; i++)
+    {
+        if (file.println(blocklist[i]) == 0)
+        {
+            file.close();
+            Serial.println(
+                "ERROR: Could not write custom blocklist");
+            return false;
+        }
+    }
+
+    file.close();
+    return true;
+}
+
+void loadCustomBlocklist()
+{
+    if (!LittleFS.exists(CUSTOM_BLOCKLIST_FILE))
+    {
+        return;
+    }
+
+    File file = LittleFS.open(
+        CUSTOM_BLOCKLIST_FILE,
+        "r");
+
+    if (!file)
+    {
+        Serial.println(
+            "ERROR: Could not load custom blocklist");
+        return;
+    }
+
+    loadingCustomBlocklist = true;
+
+    while (file.available())
+    {
+        String domain = file.readStringUntil('\n');
+        domain.trim();
+
+        if (domain.length() == 0)
+        {
+            continue;
+        }
+
+        if (blockCount >= MAX_BLOCKED_DOMAINS ||
+            addBlockedDomain(domain) == false)
+        {
+            Serial.println(
+                "WARNING: Skipping invalid custom blocklist entry");
+        }
+    }
+
+    file.close();
+    loadingCustomBlocklist = false;
+}
 
 // ============================================================
 // STATISTICS
@@ -150,64 +237,85 @@ void clearDNSLogs()
 // WIFI CONNECTION
 // ============================================================
 
-void connectWiFi()
+void connectToNetwork(const char *ssid, const char *password, bool useStaticIP)
 {
     Serial.println();
-    Serial.println("Connecting to Wi-Fi...");
+    Serial.print("Trying Wi-Fi: ");
+    Serial.println(ssid);
 
-    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(250);
 
-    if (!WiFi.config(
-            localIP,
-            gateway,
-            subnet,
-            dns1,
-            dns2))
+    if (useStaticIP)
     {
-        Serial.println(
-            "WARNING: Static IP configuration failed");
-    }
-
-    WiFi.begin(
-        WIFI_SSID,
-        WIFI_PASSWORD);
-
-    int attempts = 0;
-
-    while (
-        WiFi.status() != WL_CONNECTED &&
-        attempts < 60)
-    {
-        delay(500);
-
-        Serial.print(".");
-
-        attempts++;
-    }
-
-    Serial.println();
-
-    if (WiFi.status() == WL_CONNECTED)
-    {
-        Serial.println("==============================");
-        Serial.println("Wi-Fi connected!");
-        Serial.println("==============================");
-
-        Serial.print("ESP8266 IP: ");
-        Serial.println(WiFi.localIP());
-
-        Serial.print("Gateway: ");
-        Serial.println(WiFi.gatewayIP());
-
-        Serial.print("Signal: ");
-        Serial.print(WiFi.RSSI());
-        Serial.println(" dBm");
+        if (!WiFi.config(localIP, gateway, subnet, dns1, dns2))
+        {
+            Serial.println("WARNING: Static IP configuration failed; continuing");
+        }
     }
     else
     {
-        Serial.println(
-            "ERROR: Could not connect to Wi-Fi");
+        // Use DHCP for the mobile hotspot, whose subnet is usually different.
+        WiFi.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0),
+                    IPAddress(0, 0, 0, 0));
     }
+
+    WiFi.begin(ssid, password);
+    unsigned long attemptStarted = millis();
+    bool ledState = HIGH;
+
+    while (WiFi.status() != WL_CONNECTED && millis() - attemptStarted < 12000)
+    {
+        digitalWrite(WIFI_LED_PIN, ledState);
+        ledState = !ledState;
+        delay(300);
+        yield();
+    }
+}
+
+void connectWiFi()
+{
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+
+    // Keep trying both networks until one connects.
+    while (WiFi.status() != WL_CONNECTED)
+    {
+        connectToNetwork(ROUTER_SSID, ROUTER_PASSWORD, true);
+
+        if (WiFi.status() != WL_CONNECTED)
+        {
+            connectToNetwork(HOTSPOT_SSID, HOTSPOT_PASSWORD, false);
+        }
+
+        if (WiFi.status() != WL_CONNECTED)
+        {
+            Serial.println("Neither Wi-Fi network is available; retrying both...");
+            unsigned long waitStarted = millis();
+            bool ledState = HIGH;
+            while (millis() - waitStarted < 1500)
+            {
+                digitalWrite(WIFI_LED_PIN, ledState);
+                ledState = !ledState;
+                delay(250);
+                yield();
+            }
+        }
+    }
+
+    digitalWrite(WIFI_LED_PIN, LOW);
+    Serial.println("==============================");
+    Serial.println("Wi-Fi connected!");
+    Serial.print("Connected network: ");
+    Serial.println(WiFi.SSID());
+    Serial.print("ESP8266 IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("Gateway: ");
+    Serial.println(WiFi.gatewayIP());
+    Serial.print("Signal: ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+    Serial.println("==============================");
 }
 
 // ============================================================
@@ -327,6 +435,13 @@ bool addBlockedDomain(String domain)
 
     blockCount++;
 
+    if (!saveCustomBlocklist())
+    {
+        blockCount--;
+        blocklist[blockCount] = "";
+        return false;
+    }
+
     Serial.print(
         "Added to blocklist: ");
 
@@ -348,6 +463,9 @@ bool removeBlockedDomain(int index)
         return false;
     }
 
+    String removedDomain =
+        blocklist[index];
+
     Serial.print(
         "Removed from blocklist: ");
 
@@ -364,6 +482,23 @@ bool removeBlockedDomain(int index)
     }
 
     blockCount--;
+
+    if (!saveCustomBlocklist())
+    {
+        for (
+            int i = blockCount;
+            i > index;
+            i--)
+        {
+            blocklist[i] =
+                blocklist[i - 1];
+        }
+
+        blocklist[index] =
+            removedDomain;
+        blockCount++;
+        return false;
+    }
 
     return true;
 }
@@ -1425,6 +1560,14 @@ void setup()
 
     delay(1000);
 
+    pinMode(
+        WIFI_LED_PIN,
+        OUTPUT);
+
+    digitalWrite(
+        WIFI_LED_PIN,
+        HIGH);
+
     Serial.println();
     Serial.println(
         "================================");
@@ -1434,6 +1577,19 @@ void setup()
 
     Serial.println(
         "================================");
+
+    if (!LittleFS.begin())
+    {
+        Serial.println(
+            "ERROR: Could not mount LittleFS");
+    }
+    else
+    {
+        loadCustomBlocklist();
+        Serial.print(
+            "Loaded custom blocked domains: ");
+        Serial.println(blockCount);
+    }
 
     // --------------------------------------------------------
     // Wi-Fi
@@ -1571,6 +1727,10 @@ void loop()
     if (
         WiFi.status() != WL_CONNECTED)
     {
+        digitalWrite(
+            WIFI_LED_PIN,
+            HIGH);
+
         Serial.println(
             "Wi-Fi disconnected!");
 
