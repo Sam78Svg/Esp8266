@@ -49,6 +49,7 @@ button{font:inherit;cursor:pointer}
 .item{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid var(--line);gap:8px}
 .item:last-child{border:0}
 .item span{overflow:hidden;text-overflow:ellipsis;word-break:break-all}
+#list{max-height:360px;overflow-y:auto}
 #toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:var(--text);color:var(--bg);padding:10px 16px;border-radius:8px;opacity:0;transition:opacity .25s;pointer-events:none;font-size:14px}
 #toast.show{opacity:1}
 .cols{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
