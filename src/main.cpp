@@ -8,12 +8,9 @@
 // WIFI SETTINGS
 // ============================================================
 
-const char *ROUTER_SSID = "HomeRouter";
-const char *ROUTER_PASSWORD = "Nana@8805";
-
-// Replace these two values with your mobile hotspot details.
-const char *HOTSPOT_SSID = "moto g86";
-const char *HOTSPOT_PASSWORD = "Nana@8805";
+// Keep real Wi-Fi credentials in src/secrets.h (excluded from Git).
+#include "secrets.h"
+#include "dashboard_ui.h"
 
 // The NodeMCU built-in LED is active-low.
 const uint8_t WIFI_LED_PIN = LED_BUILTIN;
@@ -61,6 +58,18 @@ ESP8266WebServer server(80);
 
 #define MAX_BLOCKED_DOMAINS 150
 #define CUSTOM_BLOCKLIST_FILE "/custom_blocks.txt"
+
+// Generated automatically by build_blocklist.py and uploaded from data/.
+// Keep these separate from CUSTOM_BLOCKLIST_FILE: rebuilding HaGeZi must
+// never overwrite domains added from the dashboard.
+#define BLOOM_FILE "/bloom.bin"
+#define HASH_FILE "/hashes.bin"
+#define BLOOM_BITS 1048576UL
+#define BLOOM_HASHES 4
+#define HASH_RECORD_SIZE 16
+
+bool autoBlocklistReady = false;
+uint32_t autoHashCount = 0;
 
 String blocklist[MAX_BLOCKED_DOMAINS];
 
@@ -323,52 +332,177 @@ void connectWiFi()
 // CHECK IF DOMAIN IS BLOCKED
 // ============================================================
 
-bool isBlocked(String domain)
+// ============================================================
+// GENERATED BLOCKLIST LOOKUP
+// Must match build_blocklist.py:
+// FNV-1a 64 + custom hash2, Bloom positions, sorted little-endian <QQ>.
+// ============================================================
+
+uint64_t fnv1a64(const String &text)
+{
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < text.length(); i++)
+    {
+        h ^= (uint8_t)text[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+uint64_t hash2Domain(const String &text)
+{
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < text.length(); i++)
+    {
+        uint64_t byteValue = (uint8_t)text[i];
+        h ^= (byteValue + 0x9ULL + (uint64_t)i);
+        h *= 0x100000001b3ULL;
+        h ^= (h >> 29);
+    }
+    return h;
+}
+
+uint64_t readLE64(File &file)
+{
+    uint64_t value = 0;
+    for (uint8_t i = 0; i < 8; i++)
+    {
+        int b = file.read();
+        if (b < 0)
+            return 0;
+        value |= ((uint64_t)(uint8_t)b) << (8 * i);
+    }
+    return value;
+}
+
+bool bloomMayContain(File &bloom, uint64_t h1, uint64_t h2)
+{
+    for (uint8_t i = 0; i < BLOOM_HASHES; i++)
+    {
+        uint32_t position = (uint32_t)((h1 + ((uint64_t)i * h2)) % BLOOM_BITS);
+        uint32_t byteIndex = position / 8;
+        uint8_t bitIndex = position % 8;
+
+        if (!bloom.seek(byteIndex, SeekSet))
+            return false;
+
+        int value = bloom.read();
+        if (value < 0 || (((uint8_t)value & (1U << bitIndex)) == 0))
+            return false;
+    }
+    return true;
+}
+
+bool hashPairExists(File &hashFile, uint32_t count, uint64_t targetH1, uint64_t targetH2)
+{
+    uint32_t low = 0;
+    uint32_t high = count;
+
+    while (low < high)
+    {
+        uint32_t mid = low + ((high - low) / 2);
+        uint32_t offset = mid * HASH_RECORD_SIZE;
+
+        if (!hashFile.seek(offset, SeekSet))
+            return false;
+
+        uint64_t h1 = readLE64(hashFile);
+        uint64_t h2 = readLE64(hashFile);
+
+        if (h1 < targetH1 || (h1 == targetH1 && h2 < targetH2))
+            low = mid + 1;
+        else
+            high = mid;
+    }
+
+    if (low >= count || !hashFile.seek(low * HASH_RECORD_SIZE, SeekSet))
+        return false;
+
+    uint64_t h1 = readLE64(hashFile);
+    uint64_t h2 = readLE64(hashFile);
+    return h1 == targetH1 && h2 == targetH2;
+}
+
+String normalizeDomain(String domain)
 {
     domain.toLowerCase();
     domain.trim();
 
-    // Remove trailing dot
+    while (domain.endsWith("."))
+        domain.remove(domain.length() - 1);
 
-    if (domain.endsWith("."))
+    return domain;
+}
+
+bool isAutoBlocked(String domain)
+{
+    if (!autoBlocklistReady)
+        return false;
+
+    File bloom = LittleFS.open(BLOOM_FILE, "r");
+    File hashFile = LittleFS.open(HASH_FILE, "r");
+    if (!bloom || !hashFile)
     {
-        domain.remove(
-            domain.length() - 1);
+        if (bloom)
+            bloom.close();
+        if (hashFile)
+            hashFile.close();
+        return false;
     }
 
+    bool blocked = false;
+    domain = normalizeDomain(domain);
+
+    // Check the full hostname and each parent domain (e.g. a.b.example.com,
+    // then b.example.com, then example.com).
+    while (domain.length() > 0)
+    {
+        uint64_t h1 = fnv1a64(domain);
+        uint64_t h2 = hash2Domain(domain);
+
+        if (bloomMayContain(bloom, h1, h2) &&
+            hashPairExists(hashFile, autoHashCount, h1, h2))
+        {
+            blocked = true;
+            break;
+        }
+
+        int dot = domain.indexOf('.');
+        if (dot < 0)
+            break;
+        domain = domain.substring(dot + 1);
+    }
+
+    bloom.close();
+    hashFile.close();
+    return blocked;
+}
+
+// ============================================================
+// CHECK IF DOMAIN IS BLOCKED
+// Custom dashboard domains are checked first; generated HaGeZi
+// domains are checked second. Either source can block a query.
+// ============================================================
+
+bool isBlocked(String domain)
+{
+    domain = normalizeDomain(domain);
+
+    // Manually added domains remain independent and persistent.
     for (int i = 0; i < blockCount; i++)
     {
-        String blocked =
-            blocklist[i];
-
-        blocked.toLowerCase();
-        blocked.trim();
-
-        if (blocked.endsWith("."))
-        {
-            blocked.remove(
-                blocked.length() - 1);
-        }
-
-        // Exact match
+        String blocked = normalizeDomain(blocklist[i]);
 
         if (domain == blocked)
-        {
             return true;
-        }
 
-        // Subdomain match
-
-        String suffix =
-            "." + blocked;
-
+        String suffix = "." + blocked;
         if (domain.endsWith(suffix))
-        {
             return true;
-        }
     }
 
-    return false;
+    // Automatically generated HaGeZi blocklist.
+    return isAutoBlocked(domain);
 }
 
 // ============================================================
@@ -932,539 +1066,72 @@ void handleClearLogs()
 }
 
 // ============================================================
-// WEB DASHBOARD HTML
+// WEB: STATS API (JSON for the dashboard)
 // ============================================================
 
-String createWebPage()
+void handleStats()
 {
-    String html = "";
-
-    html += "<!DOCTYPE html>";
-    html += "<html>";
-
-    html += "<head>";
-
-    html +=
-        "<meta name='viewport' "
-        "content='width=device-width,initial-scale=1'>";
-
-    html +=
-        "<title>ESP8266 DNS Ad Blocker</title>";
-
-    html += "<style>";
-
-    // --------------------------------------------------------
-    // GENERAL
-    // --------------------------------------------------------
-
-    html +=
-        "body{"
-        "font-family:Arial,sans-serif;"
-        "background:#f1f3f4;"
-        "margin:0;"
-        "padding:20px;"
-        "}";
-
-    html +=
-        ".container{"
-        "max-width:700px;"
-        "margin:auto;"
-        "}";
-
-    html +=
-        ".card{"
-        "background:white;"
-        "padding:20px;"
-        "margin-bottom:16px;"
-        "border-radius:12px;"
-        "box-shadow:0 2px 8px rgba(0,0,0,.08);"
-        "}";
-
-    // --------------------------------------------------------
-    // INPUT
-    // --------------------------------------------------------
-
-    html +=
-        "input{"
-        "padding:12px;"
-        "width:65%;"
-        "font-size:16px;"
-        "border:1px solid #ccc;"
-        "border-radius:6px;"
-        "}";
-
-    // --------------------------------------------------------
-    // BUTTON
-    // --------------------------------------------------------
-
-    html +=
-        "button{"
-        "padding:12px 16px;"
-        "font-size:15px;"
-        "border:0;"
-        "border-radius:6px;"
-        "cursor:pointer;"
-        "}";
-
-    // --------------------------------------------------------
-    // COLORS
-    // --------------------------------------------------------
-
-    html +=
-        ".block{"
-        "color:#d93025;"
-        "}";
-
-    html +=
-        ".allow{"
-        "color:#188038;"
-        "}";
-
-    html +=
-        ".domain{"
-        "padding:8px 0;"
-        "border-bottom:1px solid #eee;"
-        "}";
-
-    // --------------------------------------------------------
-    // TERMINAL
-    // --------------------------------------------------------
-
-    html +=
-        ".terminal-header{"
-        "display:flex;"
-        "justify-content:space-between;"
-        "align-items:center;"
-        "margin-bottom:12px;"
-        "}";
-
-    html +=
-        ".terminal-header h2{"
-        "margin:0;"
-        "}";
-
-    html +=
-        ".clear-btn{"
-        "background:#d93025;"
-        "color:white;"
-        "padding:8px 14px;"
-        "}";
-
-    html +=
-        ".terminal{"
-        "background:#101214;"
-        "color:#e8eaed;"
-        "height:320px;"
-        "overflow-y:auto;"
-        "padding:12px;"
-        "border-radius:8px;"
-        "font-family:monospace;"
-        "font-size:13px;"
-        "line-height:1.7;"
-        "box-sizing:border-box;"
-        "}";
-
-    html +=
-        ".log-line{"
-        "white-space:nowrap;"
-        "overflow:hidden;"
-        "text-overflow:ellipsis;"
-        "}";
-
-    html +=
-        ".log-time{"
-        "color:#9aa0a6;"
-        "}";
-
-    html +=
-        ".log-blocked{"
-        "color:#ff6b6b;"
-        "}";
-
-    html +=
-        ".log-allowed{"
-        "color:#69db7c;"
-        "}";
-
-    html +=
-        ".empty-log{"
-        "color:#777;"
-        "}";
-
-    html += "</style>";
-
-    html += "</head>";
-
-    html += "<body>";
-
-    html += "<div class='container'>";
-
-    // ========================================================
-    // HEADER
-    // ========================================================
-
-    html += "<div class='card'>";
-
-    html +=
-        "<h1>ESP8266 DNS Ad Blocker</h1>";
-
-    html +=
-        "<p><b>Status:</b> Connected</p>";
-
-    html +=
-        "<p><b>ESP IP:</b> ";
-
-    html +=
-        WiFi.localIP().toString();
-
-    html += "</p>";
-
-    html +=
-        "<p><b>Router:</b> ";
-
-    html +=
-        WiFi.gatewayIP().toString();
-
-    html += "</p>";
-
-    html += "</div>";
-
-    // ========================================================
-    // STATISTICS
-    // ========================================================
-
-    html += "<div class='card'>";
-
-    html += "<h2>Statistics</h2>";
-
-    html +=
-        "<p class='block'><b>Blocked requests:</b> ";
-
-    html +=
-        String(blockedQueries);
-
-    html += "</p>";
-
-    html +=
-        "<p class='allow'><b>Allowed requests:</b> ";
-
-    html +=
-        String(allowedQueries);
-
-    html += "</p>";
-
-    html +=
-        "<p><b>Total requests:</b> ";
-
-    html +=
-        String(totalQueries);
-
-    html += "</p>";
-
-    html += "</div>";
-
-    // ========================================================
-    // DNS TERMINAL
-    // ========================================================
-
-    html += "<div class='card'>";
-
-    html +=
-        "<div class='terminal-header'>";
-
-    html +=
-        "<h2>DNS Terminal</h2>";
-
-    html +=
-        "<button "
-        "class='clear-btn' "
-        "onclick='clearLogs()'>"
-        "Clear Logs"
-        "</button>";
-
-    html += "</div>";
-
-    html +=
-        "<div id='terminal' "
-        "class='terminal'>";
-
-    html +=
-        "<div class='empty-log'>"
-        "Waiting for DNS requests..."
-        "</div>";
-
-    html += "</div>";
-
-    html += "</div>";
-
-    // ========================================================
-    // ADD DOMAIN
-    // ========================================================
-
-    html += "<div class='card'>";
-
-    html += "<h2>Add domain</h2>";
-
-    html +=
-        "<form action='/add' method='GET'>";
-
-    html +=
-        "<input "
-        "name='domain' "
-        "placeholder='example.com' "
-        "required>";
-
-    html +=
-        "<button type='submit'>Block</button>";
-
-    html += "</form>";
-
-    html +=
-        "<p>Example: ads.example.com</p>";
-
-    html += "</div>";
-
-    // ========================================================
-    // BLOCKLIST
-    // ========================================================
-
-    html += "<div class='card'>";
-
-    html += "<h2>Blocked domains</h2>";
-
-    if (blockCount == 0)
-    {
-        html +=
-            "<p>No domains are currently blocked.</p>";
-    }
-    else
-    {
-        for (
-            int i = 0;
-            i < blockCount;
-            i++)
-        {
-            html +=
-                "<div class='domain'>";
-
-            html +=
-                blocklist[i];
-
-            html +=
-                " &nbsp; ";
-
-            html +=
-                "<a href='/remove?index=";
-
-            html +=
-                String(i);
-
-            html +=
-                "'>";
-
-            html +=
-                "<button>Remove</button>";
-
-            html +=
-                "</a>";
-
-            html +=
-                "</div>";
-        }
-    }
-
-    html += "</div>";
-
-    // ========================================================
-    // FOOTER
-    // ========================================================
-
-    html += "<div class='card'>";
-
-    html +=
-        "<p><b>Upstream DNS:</b> 1.1.1.1</p>";
-
-    html +=
-        "<p>DNS server: port 53</p>";
-
-    html += "</div>";
-
-    html += "</div>";
-
-    // ========================================================
-    // JAVASCRIPT
-    // ========================================================
-
-    html += "<script>";
-
-    // --------------------------------------------------------
-    // LOAD LOGS
-    // --------------------------------------------------------
-
-    html +=
-        "async function loadLogs(){";
-
-    html +=
-        "try{";
-
-    html +=
-        "const response="
-        "await fetch('/logs');";
-
-    html +=
-        "const logs="
-        "await response.json();";
-
-    html +=
-        "const terminal="
-        "document.getElementById('terminal');";
-
-    html +=
-        "if(logs.length===0){";
-
-    html +=
-        "terminal.innerHTML="
-        "'<div class=\"empty-log\">"
-        "Waiting for DNS requests..."
-        "</div>';";
-
-    html +=
-        "return;"
-        "}";
-
-    html +=
-        "let html='';";
-
-    html +=
-        "logs.forEach(log=>{";
-
-    html +=
-        "const seconds="
-        "Math.floor(log.time/1000);";
-
-    html +=
-        "const minutes="
-        "Math.floor(seconds/60);";
-
-    html +=
-        "const secs="
-        "seconds%60;";
-
-    html +=
-        "const time="
-        "String(minutes).padStart(2,'0')"
-        "+':'"
-        "+String(secs).padStart(2,'0');";
-
-    html +=
-        "const status="
-        "log.blocked"
-        "?'<span class=\"log-blocked\">"
-        "[BLOCKED]</span>'"
-        ":"
-        "'<span class=\"log-allowed\">"
-        "[ALLOWED]</span>';";
-
-    html +=
-        "html+="
-        "'<div class=\"log-line\">'"
-        "+'<span class=\"log-time\">'"
-        "+time"
-        "+'</span> '"
-        "+status"
-        "+' '"
-        "+escapeHtml(log.domain)"
-        "+'</div>';";
-
-    html +=
-        "});";
-
-    html +=
-        "terminal.innerHTML=html;";
-
-    html +=
-        "terminal.scrollTop="
-        "terminal.scrollHeight;";
-
-    html +=
-        "}catch(e){"
-        "console.log(e);"
-        "}";
-
-    html += "}";
-
-    // --------------------------------------------------------
-    // ESCAPE HTML
-    // --------------------------------------------------------
-
-    html +=
-        "function escapeHtml(text){";
-
-    html +=
-        "const div=document.createElement('div');";
-
-    html +=
-        "div.textContent=text;";
-
-    html +=
-        "return div.innerHTML;";
-
-    html += "}";
-
-    // --------------------------------------------------------
-    // CLEAR LOGS
-    // --------------------------------------------------------
-
-    html +=
-        "async function clearLogs(){";
-
-    html +=
-        "try{";
-
-    html +=
-        "await fetch('/clear-logs',{"
-        "method:'POST'"
-        "});";
-
-    html +=
-        "loadLogs();";
-
-    html +=
-        "}catch(e){"
-        "console.log(e);"
-        "}";
-
-    html += "}";
-
-    // --------------------------------------------------------
-    // AUTO REFRESH
-    // --------------------------------------------------------
-
-    html +=
-        "loadLogs();";
-
-    html +=
-        "setInterval(loadLogs,1000);";
-
-    html += "</script>";
-
-    html += "</body>";
-
-    html += "</html>";
-
-    return html;
+    FSInfo fs;
+    const bool fsOK = LittleFS.info(fs);
+
+    String j;
+    j.reserve(460);
+    j += "{\"blocked\":" + String(blockedQueries);
+    j += ",\"allowed\":" + String(allowedQueries);
+    j += ",\"total\":" + String(totalQueries);
+    j += ",\"uptime\":" + String(millis());
+    j += ",\"ssid\":\"" + jsonEscape(WiFi.SSID().c_str()) + "\"";
+    j += ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
+    j += ",\"gw\":\"" + WiFi.gatewayIP().toString() + "\"";
+    j += ",\"rssi\":" + String(WiFi.RSSI());
+    j += ",\"flash\":" + String(ESP.getFlashChipRealSize());
+    j += ",\"fw\":" + String(ESP.getSketchSize());
+    j += ",\"ota\":" + String(ESP.getFreeSketchSpace());
+    j += ",\"heap\":" + String(ESP.getFreeHeap());
+    j += ",\"maxBlock\":" + String(ESP.getMaxFreeBlockSize());
+    j += ",\"fsTotal\":" + String(fsOK ? fs.totalBytes : 0);
+    j += ",\"fsUsed\":" + String(fsOK ? fs.usedBytes : 0);
+    j += ",\"custom\":" + String(blockCount);
+    j += ",\"customMax\":" + String(MAX_BLOCKED_DOMAINS);
+    j += ",\"autoReady\":" + String(autoBlocklistReady ? "true" : "false");
+    j += ",\"autoCount\":" + String(autoBlocklistReady ? autoHashCount : 0) + "}";
+
+    server.send(200, "application/json", j);
 }
 
 // ============================================================
-// WEB: HOME
+// WEB: CUSTOM BLOCKLIST API (JSON for the dashboard)
+// ============================================================
+
+void handleBlocklistApi()
+{
+    String j = "[";
+
+    for (int i = 0; i < blockCount; i++)
+    {
+        if (i > 0)
+        {
+            j += ",";
+        }
+
+        j += "\"" + jsonEscape(blocklist[i].c_str()) + "\"";
+    }
+
+    j += "]";
+
+    server.send(200, "application/json", j);
+}
+
+// ============================================================
+// WEB: HOME (static page served from flash, no heap use)
 // ============================================================
 
 void handleRoot()
 {
-    server.send(
+    server.send_P(
         200,
         "text/html",
-        createWebPage());
+        DASHBOARD_HTML);
 }
 
 // ============================================================
@@ -1500,6 +1167,16 @@ void handleAdd()
         return;
     }
 
+    if (server.hasArg("ajax"))
+    {
+        server.send(
+            200,
+            "application/json",
+            "{\"success\":true}");
+
+        return;
+    }
+
     server.sendHeader(
         "Location",
         "/");
@@ -1508,6 +1185,32 @@ void handleAdd()
         303,
         "text/plain",
         "");
+}
+
+// ============================================================
+// WEB: EXPORT CUSTOM DOMAINS
+// Download this before uploading a new filesystem image, because
+// uploadfs can replace the current LittleFS contents.
+// ============================================================
+
+void handleExportCustomDomains()
+{
+    if (!LittleFS.exists(CUSTOM_BLOCKLIST_FILE))
+    {
+        server.send(200, "text/plain; charset=utf-8", "");
+        return;
+    }
+
+    File file = LittleFS.open(CUSTOM_BLOCKLIST_FILE, "r");
+    if (!file)
+    {
+        server.send(500, "text/plain; charset=utf-8", "Could not open custom blocklist");
+        return;
+    }
+
+    server.sendHeader("Content-Disposition", "attachment; filename=custom_blocks.txt");
+    server.streamFile(file, "text/plain");
+    file.close();
 }
 
 // ============================================================
@@ -1537,6 +1240,16 @@ void handleRemove()
             400,
             "text/plain",
             "Invalid index");
+
+        return;
+    }
+
+    if (server.hasArg("ajax"))
+    {
+        server.send(
+            200,
+            "application/json",
+            "{\"success\":true}");
 
         return;
     }
@@ -1590,6 +1303,38 @@ void setup()
         Serial.print(
             "Loaded custom blocked domains: ");
         Serial.println(blockCount);
+
+        // Generated list is optional; custom dashboard blocking still works
+        // if the generated files are absent or invalid.
+        if (LittleFS.exists(BLOOM_FILE) && LittleFS.exists(HASH_FILE))
+        {
+            File bloomFile = LittleFS.open(BLOOM_FILE, "r");
+            File hashFile = LittleFS.open(HASH_FILE, "r");
+
+            bool bloomSizeOK = bloomFile && ((uint32_t)bloomFile.size() == (BLOOM_BITS / 8));
+            bool hashSizeOK = hashFile && (hashFile.size() > 0) &&
+                              ((hashFile.size() % HASH_RECORD_SIZE) == 0);
+
+            if (bloomFile)
+                bloomFile.close();
+
+            if (hashSizeOK)
+                autoHashCount = hashFile.size() / HASH_RECORD_SIZE;
+
+            if (hashFile)
+                hashFile.close();
+
+            autoBlocklistReady = bloomSizeOK && hashSizeOK && autoHashCount > 0;
+
+            Serial.print("Generated blocklist: ");
+            Serial.println(autoBlocklistReady ? "READY" : "INVALID FILES");
+            Serial.print("Generated hash entries: ");
+            Serial.println(autoBlocklistReady ? autoHashCount : 0);
+        }
+        else
+        {
+            Serial.println("Generated blocklist files missing; custom blocking remains enabled.");
+        }
     }
 
     // --------------------------------------------------------
@@ -1661,6 +1406,23 @@ void setup()
         "/remove",
         HTTP_GET,
         handleRemove);
+
+    server.on(
+        "/custom-blocks.txt",
+        HTTP_GET,
+        handleExportCustomDomains);
+
+    // Dashboard JSON APIs
+
+    server.on(
+        "/api/stats",
+        HTTP_GET,
+        handleStats);
+
+    server.on(
+        "/api/blocklist",
+        HTTP_GET,
+        handleBlocklistApi);
 
     // DNS terminal API
 
