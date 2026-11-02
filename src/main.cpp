@@ -16,15 +16,14 @@
 const uint8_t WIFI_LED_PIN = LED_BUILTIN;
 
 // ============================================================
-// IN MY CASEE
 // NETWORK SETTINGS
-// Router: 192.168.31.1
-// ESP8266: 192.168.31.50
+// Router address is configured in src/secrets.h.
+// ESP8266 address is configured in src/secrets.h.
 // ============================================================
 
-IPAddress localIP(192, 168, 31, 50);
-IPAddress gateway(192, 168, 31, 1);
-IPAddress subnet(255, 255, 255, 0);
+IPAddress localIP(NETWORK_IP);
+IPAddress gateway(NETWORK_GATEWAY);
+IPAddress subnet(NETWORK_SUBNET);
 
 // DNS servers used by ESP8266 itself
 IPAddress dns1(1, 1, 1, 1);

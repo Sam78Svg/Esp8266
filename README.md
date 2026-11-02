@@ -1,227 +1,134 @@
-# ESP8266 DNS Ad Blocker
+# ESP8266 DNS Blocker
 
-A small DNS filter that runs on an ESP8266 NodeMCU. It checks the domain names requested by devices on your Wi-Fi network. It blocks matching domains and asks an upstream DNS server to look up everything else.
+A DNS-based ad and domain blocker for an ESP8266 NodeMCU. Devices use the ESP8266 as their DNS server; matching domains are blocked locally, while other requests are forwarded to public DNS resolvers.
 
-This project is for people who want to learn about DNS filtering or manage their own network. It does not inspect web pages or act as a general internet firewall. This Project Corrently Have 78,373 add Url's And 23 Custom Url's in custome_blocks.txt for blocking add on some of the OTT Plaforms. 
+This is an experimental hobby project, not a production security product. Test it on one device before changing your router's DNS settings.
 
-## What it does
-
-- Runs a DNS server on the ESP8266.
-- Blocks domains from a custom list and, optionally, a generated HaGeZi blocklist.
-- Also blocks subdomains of a blocked domain. For example, blocking `example.com` blocks `ads.example.com`.
-- Forwards other DNS requests to Cloudflare DNS (`1.1.1.1`).
-- Hosts a web dashboard with request counts, a live log, and custom blocklist controls.
-- Shows the source client IP beside each DNS log entry; the live-log search matches both domains and client IP addresses.
-- Saves custom blocked domains in the ESP8266's LittleFS flash storage.
-
-## Screenshots
-
-### Dashboard
-
-![ESP8266 dashboard](screenshots/dashboard.png)
-
-### Live DNS log
-
-![Live DNS log](screenshots/dns-terminal.png)
-
-### Custom blocklist
-
-![Custom blocklist](screenshots/blocked-domains.png)
-
-## How a request is handled
+## How it works
 
 ```mermaid
 flowchart LR
-    Device["Phone, computer, or other device"] -->|"DNS lookup"| ESP["ESP8266 DNS filter"]
-    ESP --> Check{"Is the domain on either blocklist?"}
-    Check -->|"Yes"| Block["Reply: domain does not exist"]
-    Check -->|"No"| Upstream["Ask upstream DNS: 1.1.1.1"]
-    Upstream --> Reply["Return the DNS answer to the device"]
-    Block --> Device
-    Reply --> Device
-    Device -->|"Normal web or app traffic"| Router["Wi-Fi router"] --> Internet["Internet"]
+    device[Phone, computer, or other client] -->|DNS over UDP port 53| esp[ESP8266 DNS blocker]
+    esp -->|Domain is blocked| block[Return blocked response]
+    esp -->|Domain is allowed| upstream[Forward query to upstream DNS]
+    upstream -->|DNS response| esp
+    esp -->|DNS response| device
+    admin[Browser on local network] -->|HTTP| dashboard[Dashboard and DNS logs]
+    dashboard --> esp
 ```
 
-The live log records the source IP address seen by the ESP8266 for each DNS request. It does not resolve IP addresses to device names or MAC addresses.
+The generated blocklist uses a Bloom filter and a sorted hash file stored in LittleFS. Custom blocked domains are managed separately from the generated list.
 
-Only DNS lookups pass through the ESP8266. After a domain is resolved, the device connects to the website or service through the router as usual.
+## Features
 
-## What you need
+- DNS filtering against a generated HaGeZi blocklist and a custom domain list.
+- A local web dashboard with request statistics, live DNS logs, and blocklist management.
+- Router Wi-Fi connection with a phone-hotspot fallback.
+- Static router-network address configuration.
+- Optional custom blocklist regeneration with `build_blocklist.py`.
+- LittleFS storage for generated blocklist files and custom domains.
 
-- An ESP8266 NodeMCU V3 / ESP-12E board
-- A USB cable and a computer
-- A 2.4 GHz Wi-Fi network (the ESP8266 does not support 5 GHz Wi-Fi)
-- VS Code with the PlatformIO extension
+The local working copy may contain additional experimental features that are not yet present in the published source. The setup and feature list here describe the basic project available from the repository's current published revision.
 
-## Network settings
+## Hardware and software
 
-The current defaults in [`src/main.cpp`](src/main.cpp) are (adjust them if your router uses a different subnet):
+- ESP8266 NodeMCU board with 4 MB flash (the PlatformIO environment is `nodemcuv2`).
+- USB data cable and a computer that can access the board's serial port.
+- Visual Studio Code with the PlatformIO IDE extension, or PlatformIO Core (`pio`).
+- Python 3 if you want to regenerate the blocklist.
+- A 2.4 GHz Wi-Fi network. The ESP8266 does not support 5 GHz Wi-Fi.
 
-| Setting | Default |
-| --- | --- |
-| ESP8266 address on the router network | `192.168.31.50` |
-| Router / gateway | `192.168.31.1` |
-| Network mask | `255.255.255.0` |
-| DNS server used for lookups | `1.1.1.1` |
-| DNS port | UDP `53` |
-| Dashboard port | HTTP `80` |
+## First-time setup
 
-These are example defaults, not requirements for every network. Before using them, check your router's address and choose an ESP8266 address in the same subnet that is not already in use. A DHCP reservation in your router is a good way to prevent an address conflict.
+1. Clone or download this repository and open its folder in VS Code.
+2. Create your private Wi-Fi settings file by copying `src/secrets.example.h` to `src/secrets.h`.
+3. Edit `src/secrets.h` with your router and optional hotspot SSIDs/passwords. This file is ignored by Git; do not commit it.
+4. Choose an unused static address on your own LAN and set the matching IP, gateway, and subnet values in `src/secrets.h`. The example values use the reserved documentation network `192.0.2.0/24`; they are examples only and will not work on a real LAN.
+5. Install the PlatformIO dependencies when prompted, then build:
 
-The firmware tries the configured router Wi-Fi first, then the configured mobile hotspot. It uses the static address above on the router network and DHCP on the hotspot. If it connects to the hotspot, read the actual address from the Serial Monitor.
-
-## Install and configure
-
-1. Install VS Code and the PlatformIO extension.
-2. Open this project in VS Code.
-3. Create `src/secrets.h` on your computer. This file is excluded from Git. Add your own Wi-Fi names and passwords in this format:
-
-   ```cpp
-   #pragma once
-
-   #define ROUTER_SSID "YOUR_ROUTER_WIFI_NAME"
-   #define ROUTER_PASSWORD "YOUR_ROUTER_WIFI_PASSWORD"
-
-   #define HOTSPOT_SSID "YOUR_HOTSPOT_NAME"
-   #define HOTSPOT_PASSWORD "YOUR_HOTSPOT_PASSWORD"
+   ```sh
+   pio run -e nodemcuv2
    ```
 
-   If you do not want to use a hotspot, set its name and password to values for a network you control. The firmware expects all four definitions.
+6. Connect the board by USB and upload the firmware:
 
-4. If your router uses a different network range, update `localIP`, `gateway`, and `subnet` near the beginning of `src/main.cpp`. Make sure the ESP8266 address is available and that the gateway and subnet match your network.
-5. Connect the board by USB, then use PlatformIO's **Build** and **Upload** actions.
-6. Open the PlatformIO Serial Monitor at **115200 baud**. Note the IP address printed after Wi-Fi connects.
-7. In a browser on the same Wi-Fi network, open `http://<ESP8266-IP>` (for example, `http://192.168.0.50` when using the default router-network address).
+   ```sh
+   pio run -e nodemcuv2 -t upload
+   ```
 
-Keep `src/secrets.h` private. Do not put real Wi-Fi passwords in source files that you commit or publish.
+7. Upload the LittleFS image if the device needs the generated blocklist or custom-domain file:
 
-## Make devices use the filter
+   ```sh
+   pio run -e nodemcuv2 -t uploadfs
+   ```
 
-The ESP8266 only filters requests from devices that send their DNS lookups to it.
+   **Warning:** Uploading a filesystem image replaces the ESP8266's LittleFS contents. Back up any custom domains or other data before doing this. The firmware and filesystem are separate uploads.
 
-For a single device, open its Wi-Fi network settings and set its DNS server to the ESP8266's IP address (IP Can Vary). Keep the device on the same network as the ESP8266. For example:
+8. Open the PlatformIO serial monitor at 115200 baud:
 
-| Device setting | Example |
-| --- | --- |
-| DNS server | `192.168.31.50` |
-| Gateway | Your router's address, such as `192.168.31.1` |
+   ```sh
+   pio device monitor -b 115200
+   ```
 
-For network-wide use, configure your router's DHCP/DNS settings to give clients the ESP8266 address as their DNS server, if the router supports that. Do not configure the router's own upstream DNS as the ESP8266 unless the router supports the required DNS forwarding setup.
+   Check the output for the connected Wi-Fi network and the board's assigned IP address.
+9. From a device on the same local network, open `http://<ESP8266-IP>/` in a browser. For example, `http://192.0.2.50/` is a documentation-only example; replace it with the address configured for your own board.
+10. Test DNS filtering with one client. Only after it works, configure your router or client to use the ESP8266 as its DNS server.
 
-On Android, turn **Private DNS** off while testing. Private DNS and other encrypted DNS options can bypass the normal DNS setting. A second DNS server can also allow a device to bypass the filter.
+Keep the partition setting `board_build.ldscript = eagle.flash.4m2m.ld` in `platformio.ini`; changing the flash layout can prevent the filesystem or firmware from fitting.
 
-## Test it
+## Network and privacy notes
 
-From Windows, ask the ESP8266 to resolve a normal domain (IP Addres Can Vary):
-
-```powershell
-nslookup example.org 192.168.0.50
-```
-
-To test blocking, first add a test domain such as `example.com` in the dashboard, then run:
-
-```powershell
-nslookup example.com 192.168.0.50
-```
-
-The blocked lookup should report that the domain does not exist. Requests should also appear in the dashboard's live log and in the Serial Monitor.
+- Addresses in `src/secrets.example.h` are RFC 5737 documentation examples, not real devices. Replace them with values appropriate for your own network.
+- Do not put your Wi-Fi credentials, public IP, or other private network details in `README.md`, screenshots, logs, or commits. The local `src/secrets.h` file is Git-ignored.
+- The dashboard and DNS service are intended for a trusted local network. HTTP is not encrypted; do not expose the dashboard or device to the public internet.
+- DNS logs can reveal domains requested by devices on your network. Review and redact logs/screenshots before sharing them.
+- Allowed DNS requests are sent to the configured upstream resolvers. Do not treat this project as a firewall or as a guarantee of anonymity.
 
 ## Dashboard
 
-The dashboard is hosted by the ESP8266; it does not need a separate server or internet connection to display.
+Open the dashboard at `http://<ESP8266-IP>/`. It provides live request information, aggregate counters, and controls for the custom blocklist. The device prints its current IP address to the serial monitor at startup.
 
-- **Overview:** blocked, allowed, and total request counts, plus the block rate.
-- **Live log:** the latest 100 requests, with filters and domain search. The time shown is elapsed time since the ESP8266 started, not the current clock time.
-- **Blocklist:** add or remove custom domains and download a backup of the custom list.
-- **System:** Wi-Fi status, network details, uptime, storage use, and memory information.
+### HTTP endpoints
 
-The request counters and log are held in RAM and reset when the board restarts. Clearing the logs only clears the log; it does not reset the counters or remove blocked domains.
+| Path | Method | Purpose |
+|---|---|---|
+| `/` | GET | Dashboard |
+| `/logs` | GET | Recent DNS log data |
+| `/clear-logs` | POST | Clear the in-memory DNS log |
+| `/api/stats` | GET | Aggregate request and device status |
+| `/api/blocklist` | GET | List custom blocked domains |
+| `/add?ajax=1&domain=example.com` | GET | Add a custom blocked domain |
+| `/remove?domain=example.com` | GET | Remove a custom blocked domain |
+| `/custom-blocks.txt` | GET | Download a custom-blocklist backup |
 
-Custom entries are saved in LittleFS and limited to 150 domains. Download a backup from the dashboard before uploading a new filesystem image: an upload can replace the files stored in the ESP8266's flash.
+Use the dashboard for everyday management; the endpoints are provided for integrations and troubleshooting. URL-encode domain values when calling an endpoint directly.
 
-## Blocklists
+## Regenerating the generated blocklist
 
-The project has two separate sources of blocked domains:
+The checked-in `data/` directory contains the generated LittleFS inputs. To download the current source list and recreate the generated files, run this from the repository root:
 
-| List | What it contains | Where it is stored | How to manage it |
-| --- | --- | --- | --- |
-| Custom list | Domains added in the dashboard | LittleFS file `custom_blocks.txt` | Add, remove, or download a backup in the dashboard |
-| Generated list | Domains converted from the HaGeZi Multi LIGHT list | LittleFS files `bloom.bin` and `hashes.bin` | Build with `build_blocklist.py`, then upload the filesystem |
-
-Either list can block a lookup. The generated list is optional: if its files are missing or invalid, custom blocking still works.
-
-### Build or refresh the generated list (optional)
-
-The Python script downloads the latest HaGeZi Multi LIGHT source list, converts it into compact lookup files, and removes its temporary download when it finishes. Run these commands from the project folder:
-
-```powershell
+```sh
 python build_blocklist.py
 ```
 
-Then use PlatformIO's **Upload Filesystem Image** action, or run:
-
-```powershell
-pio run -t uploadfs
-```
-
-Uploading a filesystem image can replace the ESP8266's existing LittleFS contents, including custom domains added through the dashboard. Download the custom list first and restore it after the upload if needed.
-
-## How the generated list is checked
-
-The generated list uses a compact Bloom filter to quickly reject most domains that are not listed. If the Bloom filter says a domain might be listed, the firmware checks for matching hash values in a sorted file. This second check prevents Bloom-filter-only false positives from being blocked.
-
-```mermaid
-flowchart TD
-    Source["HaGeZi source list"] --> Script["build_blocklist.py"]
-    Script --> Bloom["bloom.bin: quick first check"]
-    Script --> Hashes["hashes.bin: exact hash check"]
-    Bloom --> Device["Upload both files to LittleFS"]
-    Hashes --> Device
-    Query["DNS request"] --> First{"Bloom filter says maybe?"}
-    First -->|"No"| Allow["Not in generated list"]
-    First -->|"Yes"| Exact{"Hash exists in sorted file?"}
-    Exact -->|"Yes"| Block["Block domain"]
-    Exact -->|"No"| Allow
-```
-
-The dashboard's custom list is checked as well. A match in either list blocks the requested domain and its subdomains.
-
-## Project files
-
-```text
-.
-├── build_blocklist.py       # Downloads and converts the generated blocklist
-├── data/
-│   ├── bloom.bin            # Generated Bloom filter
-│   ├── custom_blocks.txt    # Custom list copied to LittleFS
-│   └── hashes.bin           # Generated sorted hash data
-├── screenshots/             # Dashboard screenshots
-├── src/
-│   ├── dashboard_ui.h       # Dashboard page
-│   ├── main.cpp             # DNS server, Wi-Fi, and web server
-│   └── secrets.h            # Your local Wi-Fi credentials; ignored by Git
-└── platformio.ini           # Board and build settings
-```
-
-The `data` directory is the source for the filesystem image uploaded to LittleFS. The Python builder creates or replaces the generated blocklist files there.
+The script downloads the HaGeZi light list from the URL configured in the script and writes `data/bloom.bin` and `data/hashes.bin`. Review the script and upstream list source before running it. After regeneration, upload the filesystem image as described above; this replaces the filesystem contents on the device.
 
 ## Limitations
 
-- This is DNS filtering, not a full ad blocker. It cannot inspect HTTPS pages or remove ads embedded in a video stream.
-- An app may bypass the configured DNS server using encrypted DNS, its own resolver, or cached answers.
-- Blocking a domain used for both ads and normal content may break the service rather than remove only its ads.
-- The ESP8266 has limited memory and is best suited to a small home or test network. This firmware handles DNS requests one at a time.
-- DNS filtering stops while the ESP8266 is powered off or disconnected.
-- Changes can take time to appear because devices and applications may cache DNS answers.
+- DNS filtering applies only to devices configured to use this ESP8266 for DNS. Some devices or applications may use encrypted DNS or a hard-coded resolver and bypass it.
+- The ESP8266 has limited RAM and processing capacity; this is intended for a small home or test network.
+- A DNS block is not the same as blocking a web connection. It does not inspect page content, filter URLs, or stop connections to an IP address already known to a client.
+- Network settings, upstream resolvers, and blocklist data are project configuration; review them before relying on the device.
+- Build and test the firmware locally before using it as a network-wide DNS server.
 
-## Safety and privacy
+## Troubleshooting
 
-Use this only on networks and devices you own or are authorized to manage. Keep Wi-Fi credentials private, and remember that request logs show domain names looked up by connected devices. The logs and request counters are stored only in RAM and are not retained after a restart.
+- **Build fails because `secrets.h` is missing:** copy `src/secrets.example.h` to `src/secrets.h` and fill in the values.
+- **Board does not connect:** verify the SSID/password and the 2.4 GHz network. Confirm the static address, gateway, and subnet match your LAN.
+- **Dashboard does not load:** read the board's IP address from the serial monitor and confirm your browser is on the same network.
+- **No generated blocking:** check the serial output for missing or invalid blocklist files, then regenerate the list and upload the filesystem image.
+- **DNS stops working after changing router settings:** restore the previous DNS settings and test the ESP8266 directly before trying again.
 
 ## License
 
-There is currently no `LICENSE` file in this repository. Add a license file before redistributing the project or setting terms for reuse.
-
----
-
-Built with ESP8266, Arduino, PlatformIO, DNS, and LittleFS.
+See the repository's license file, if present.
