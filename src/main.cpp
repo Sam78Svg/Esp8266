@@ -3,6 +3,9 @@
 #include <WiFiUdp.h>
 #include <ESP8266WebServer.h>
 #include <LittleFS.h>
+#include <time.h>
+#include <ESP8266mDNS.h>
+#include <ESP8266HTTPUpdateServer.h>
 
 // ============================================================
 // WIFI SETTINGS
@@ -16,9 +19,10 @@
 const uint8_t WIFI_LED_PIN = LED_BUILTIN;
 
 // ============================================================
+// IN MY CASEE
 // NETWORK SETTINGS
-// Router address is configured in src/secrets.h.
-// ESP8266 address is configured in src/secrets.h.
+// Router: 192.168.31.1
+// ESP8266: 192.168.31.50
 // ============================================================
 
 IPAddress localIP(NETWORK_IP);
@@ -34,6 +38,11 @@ IPAddress dns2(8, 8, 8, 8);
 // ============================================================
 
 IPAddress upstreamDNS(1, 1, 1, 1);
+IPAddress upstreamDNSBackup(8, 8, 8, 8);
+ESP8266HTTPUpdateServer httpUpdater;
+static const char *OTA_PATH = "/update";
+static const char *OTA_USER = "admin";
+static const char *OTA_PASSWORD = "Sangam@23";
 
 // ============================================================
 // DNS SERVERS
@@ -55,7 +64,7 @@ ESP8266WebServer server(80);
 // BLOCKLIST
 // ============================================================
 
-#define MAX_BLOCKED_DOMAINS 150
+#define MAX_BLOCKED_DOMAINS 300
 #define CUSTOM_BLOCKLIST_FILE "/custom_blocks.txt"
 
 // Generated automatically by build_blocklist.py and uploaded from data/.
@@ -158,7 +167,347 @@ void loadCustomBlocklist()
 
 unsigned long blockedQueries = 0;
 unsigned long allowedQueries = 0;
+
 unsigned long totalQueries = 0;
+unsigned long upstreamFailures = 0;
+unsigned long upstreamFallbacks = 0;
+unsigned long cacheHits = 0;
+unsigned long cacheMisses = 0;
+unsigned long lastStatsSave = 0;
+unsigned long lastWiFiCheck = 0;
+bool blockingPaused = false;
+String scheduledDomain = "";
+String scheduledClient = "";
+int scheduleStartHour = 22;
+int scheduleEndHour = 7;
+bool scheduleEnabled = false;
+unsigned long pauseUntil = 0;
+const char *ALLOWLIST_FILE = "/allowlist.txt";
+const char *STATS_FILE = "/stats.dat";
+String allowlist[100];
+uint8_t allowCount = 0;
+
+// Keep the response cache bounded to leave heap for the ESP8266 Wi-Fi stack.
+#define DNS_CACHE_ENTRIES 25
+#define DNS_CACHE_PACKET_MAX 256
+#define ESP8266_RAM_BUDGET_BYTES 81920UL
+struct DNSCacheEntry
+{
+    bool valid;
+    char key[112];
+    uint8_t packet[DNS_CACHE_PACKET_MAX];
+    uint16_t length;
+    uint32_t expiresAt;
+    uint32_t insertedAt;
+    uint32_t ttlSeconds;
+    uint32_t lastUsed;
+};
+DNSCacheEntry dnsCache[DNS_CACHE_ENTRIES];
+uint32_t cacheClock = 0;
+WiFiEventHandler stationDisconnectHandler;
+
+struct ClientStat
+{
+    IPAddress ip;
+    uint32_t total;
+    uint32_t blocked;
+    bool used;
+};
+ClientStat clientStats[16];
+uint32_t dailyAllowed = 0, dailyBlocked = 0;
+int savedDay = -1;
+
+int skipDNSName(const uint8_t *p, int len, int pos);
+String normalizeDomain(String domain);
+String readDomainName(uint8_t *packet, int &position, int packetSize);
+bool scheduledBlock(String domain, IPAddress clientIP)
+{
+    if (!scheduleEnabled || time(nullptr) < 1700000000)
+        return false;
+    if (scheduledClient.length() && scheduledClient != clientIP.toString())
+        return false;
+    domain = normalizeDomain(domain);
+    String d = normalizeDomain(scheduledDomain);
+    if (!d.length() || !(domain == d || domain.endsWith("." + d)))
+        return false;
+    time_t now = time(nullptr);
+    struct tm *tmNow = localtime(&now);
+    if (!tmNow)
+        return false;
+    int h = tmNow->tm_hour;
+    return scheduleStartHour < scheduleEndHour
+               ? (h >= scheduleStartHour && h < scheduleEndHour)
+               : (h >= scheduleStartHour || h < scheduleEndHour);
+}
+void loadSchedule()
+{
+    if (!LittleFS.exists("/schedule.txt"))
+        return;
+    File f = LittleFS.open("/schedule.txt", "r");
+    if (!f)
+        return;
+    scheduledClient = f.readStringUntil('|');
+    scheduledClient.trim();
+    scheduledDomain = f.readStringUntil('|');
+    scheduledDomain.trim();
+    scheduleStartHour = f.readStringUntil('|').toInt();
+    scheduleEndHour = f.readStringUntil('\n').toInt();
+    f.close();
+    scheduleEnabled = scheduledDomain.length() > 0 && scheduleStartHour >= 0 &&
+                      scheduleStartHour <= 23 && scheduleEndHour >= 0 && scheduleEndHour <= 23;
+}
+void saveSchedule()
+{
+    File f = LittleFS.open("/schedule.txt", "w");
+    if (!f)
+        return;
+    f.print(scheduledClient);
+    f.print('|');
+    f.print(scheduledDomain);
+    f.print('|');
+    f.print(scheduleStartHour);
+    f.print('|');
+    f.println(scheduleEndHour);
+    f.close();
+}
+void clearDNSCache()
+{
+    for (uint8_t i = 0; i < DNS_CACHE_ENTRIES; i++)
+        dnsCache[i].valid = false;
+}
+void updateClientStats(IPAddress ip, bool blocked)
+{
+    int slot = -1, oldest = 0;
+    for (int i = 0; i < 16; i++)
+    {
+        if (clientStats[i].used && clientStats[i].ip == ip)
+        {
+            slot = i;
+            break;
+        }
+        if (!clientStats[i].used)
+            oldest = i;
+    }
+    if (slot < 0)
+        slot = oldest;
+    if (!clientStats[slot].used || !(clientStats[slot].ip == ip))
+    {
+        clientStats[slot].ip = ip;
+        clientStats[slot].total = 0;
+        clientStats[slot].blocked = 0;
+        clientStats[slot].used = true;
+    }
+    clientStats[slot].total++;
+    if (blocked)
+        clientStats[slot].blocked++;
+}
+bool isAllowlisted(String domain)
+{
+    domain = normalizeDomain(domain);
+    for (uint8_t i = 0; i < allowCount; i++)
+    {
+        String d = normalizeDomain(allowlist[i]);
+        if (domain == d || domain.endsWith("." + d))
+            return true;
+    }
+    return false;
+}
+bool addAllowDomain(String d)
+{
+    d = normalizeDomain(d);
+    if (!d.length() || allowCount >= 100)
+        return false;
+    if (isAllowlisted(d))
+        return true;
+    File f = LittleFS.open(ALLOWLIST_FILE, "a");
+    if (!f)
+        return false;
+    f.println(d);
+    f.close();
+    allowlist[allowCount++] = d;
+    clearDNSCache();
+    return true;
+}
+void loadAllowlist()
+{
+    allowCount = 0;
+    if (!LittleFS.exists(ALLOWLIST_FILE))
+        return;
+    File f = LittleFS.open(ALLOWLIST_FILE, "r");
+    while (f && f.available() && allowCount < 100)
+    {
+        String d = f.readStringUntil('\n');
+        d.trim();
+        if (d.length())
+            allowlist[allowCount++] = normalizeDomain(d);
+    }
+    if (f)
+        f.close();
+}
+void saveStats()
+{
+    File f = LittleFS.open(STATS_FILE, "w");
+    if (!f)
+        return;
+    f.printf("%lu %lu %lu %lu %lu\n",
+             (unsigned long)blockedQueries,
+             (unsigned long)allowedQueries,
+             (unsigned long)totalQueries,
+             (unsigned long)dailyBlocked,
+             (unsigned long)dailyAllowed);
+    f.close();
+    lastStatsSave = millis();
+}
+void loadStats()
+{
+    if (!LittleFS.exists(STATS_FILE))
+        return;
+    File f = LittleFS.open(STATS_FILE, "r");
+    if (f)
+    {
+        String line = f.readStringUntil('\n');
+        f.close();
+        unsigned long b = 0, a = 0, t = 0, d = 0, da = 0;
+        if (sscanf(line.c_str(), "%lu %lu %lu %lu %lu", &b, &a, &t, &d, &da) >= 4)
+        {
+            blockedQueries = b;
+            allowedQueries = a;
+            totalQueries = t;
+            dailyBlocked = d;
+            dailyAllowed = da;
+        }
+    }
+}
+String makeCacheKey(const uint8_t *p, int len)
+{
+    int pos = 12;
+    String d = readDomainName((uint8_t *)p, pos, len);
+    if (!d.length() || pos + 4 > len)
+        return "";
+    return normalizeDomain(d) + ":" + String((p[pos] << 8) | p[pos + 1]) + ":" + String((p[pos + 2] << 8) | p[pos + 3]);
+}
+bool cacheLookup(const String &key, IPAddress ip, uint16_t port, const uint8_t *query)
+{
+    uint32_t now = millis() / 1000;
+    for (uint8_t i = 0; i < DNS_CACHE_ENTRIES; i++)
+    {
+        DNSCacheEntry &e = dnsCache[i];
+        if (!e.valid)
+            continue;
+        if ((int32_t)(now - e.expiresAt) >= 0)
+        {
+            e.valid = false;
+            continue;
+        }
+        if (key == e.key)
+        {
+            uint8_t out[DNS_CACHE_PACKET_MAX];
+            memcpy(out, e.packet, e.length);
+            out[0] = query[0];
+            out[1] = query[1];
+            uint32_t remaining = (e.expiresAt - now);
+            uint16_t qd = (out[4] << 8) | out[5], an = (out[6] << 8) | out[7];
+            int pos = 12;
+            for (uint16_t q = 0; q < qd; q++)
+            {
+                pos = skipDNSName(out, e.length, pos);
+                pos += 4;
+            }
+            for (uint16_t a = 0; a < an && pos + 10 <= e.length; a++)
+            {
+                pos = skipDNSName(out, e.length, pos);
+                if (pos + 10 > e.length)
+                    break;
+                out[pos + 4] = (remaining >> 24) & 255;
+                out[pos + 5] = (remaining >> 16) & 255;
+                out[pos + 6] = (remaining >> 8) & 255;
+                out[pos + 7] = remaining & 255;
+                uint16_t rd = (out[pos + 8] << 8) | out[pos + 9];
+                pos += 10 + rd;
+            }
+            clientDNS.beginPacket(ip, port);
+            clientDNS.write(out, e.length);
+            clientDNS.endPacket();
+            e.lastUsed = ++cacheClock;
+            cacheHits++;
+            return true;
+        }
+    }
+    cacheMisses++;
+    return false;
+}
+int skipDNSName(const uint8_t *p, int len, int pos)
+{
+    while (pos < len)
+    {
+        uint8_t n = p[pos];
+        if (n == 0)
+            return pos + 1;
+        if ((n & 0xC0) == 0xC0)
+            return (pos + 1 < len) ? pos + 2 : len + 1;
+        if (n & 0xC0)
+            return len + 1;
+        pos += 1 + n;
+        if (pos > len)
+            return len + 1;
+    }
+    return len + 1;
+}
+void cacheStore(const String &key, const uint8_t *packet, int len)
+{
+    if (!key.length() || len < 12 || len > DNS_CACHE_PACKET_MAX)
+        return;
+    uint32_t ttl = 86400;
+    uint16_t qd = (packet[4] << 8) | packet[5], an = (packet[6] << 8) | packet[7];
+    if (!an || (packet[3] & 0x0F) != 0)
+        return;
+    int pos = 12;
+    for (uint16_t q = 0; q < qd; q++)
+    {
+        pos = skipDNSName(packet, len, pos);
+        if (pos + 4 > len)
+            return;
+        pos += 4;
+    }
+    for (uint16_t a = 0; a < an; a++)
+    {
+        pos = skipDNSName(packet, len, pos);
+        if (pos + 10 > len)
+            return;
+        uint32_t t = ((uint32_t)packet[pos + 4] << 24) | ((uint32_t)packet[pos + 5] << 16) | ((uint32_t)packet[pos + 6] << 8) | packet[pos + 7];
+        if (t < ttl)
+            ttl = t;
+        uint16_t rdlen = (packet[pos + 8] << 8) | packet[pos + 9];
+        pos += 10 + rdlen;
+        if (pos > len)
+            return;
+    }
+    if (ttl == 0)
+        return;
+    if (ttl > 86400)
+        ttl = 86400;
+    int slot = 0;
+    for (int i = 0; i < DNS_CACHE_ENTRIES; i++)
+    {
+        if (!dnsCache[i].valid)
+        {
+            slot = i;
+            break;
+        }
+        if (dnsCache[i].lastUsed < dnsCache[slot].lastUsed)
+            slot = i;
+    }
+    DNSCacheEntry &e = dnsCache[slot];
+    strncpy(e.key, key.c_str(), sizeof(e.key) - 1);
+    e.key[sizeof(e.key) - 1] = 0;
+    memcpy(e.packet, packet, len);
+    e.length = len;
+    e.insertedAt = millis() / 1000;
+    e.ttlSeconds = ttl;
+    e.expiresAt = e.insertedAt + ttl;
+    e.lastUsed = ++cacheClock;
+    e.valid = true;
+}
 
 // ============================================================
 // DNS LOG TERMINAL
@@ -207,7 +556,7 @@ void addDNSLog(
         logCount = MAX_LOGS - 1;
     }
 
-    dnsLogs[logCount].time = millis();
+    dnsLogs[logCount].time = (time(nullptr) > 1700000000) ? (unsigned long)time(nullptr) : millis();
     dnsLogs[logCount].blocked = blocked;
     clientIP.toString().toCharArray(
         dnsLogs[logCount].clientIP,
@@ -251,46 +600,154 @@ void clearDNSLogs()
 // WIFI CONNECTION
 // ============================================================
 
+bool isOnSameSubnet(const IPAddress &ip, const IPAddress &gatewayAddress, const IPAddress &mask)
+{
+    for (byte i = 0; i < 4; i++)
+    {
+        if ((ip[i] & mask[i]) != (gatewayAddress[i] & mask[i]))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 void connectToNetwork(const char *ssid, const char *password, bool useStaticIP)
 {
     Serial.println();
     Serial.print("Trying Wi-Fi: ");
     Serial.println(ssid);
 
+    // Start each attempt from a clean station state.
     WiFi.disconnect();
-    delay(250);
+    delay(500);
 
-    if (useStaticIP)
+    bool staticConfigApplied = false;
+
+    // Apply the router's static address before WiFi.begin().
+    // For the phone hotspot, do not call WiFi.config(): DHCP is the default.
+    if (useStaticIP && isOnSameSubnet(localIP, gateway, subnet))
     {
-        if (!WiFi.config(localIP, gateway, subnet, dns1, dns2))
+        staticConfigApplied = WiFi.config(localIP, gateway, subnet, dns1, dns2);
+        if (staticConfigApplied)
         {
-            Serial.println("WARNING: Static IP configuration failed; continuing");
+            Serial.print("Static IP configured: ");
+            Serial.println(localIP);
+        }
+        else
+        {
+            Serial.println("WARNING: Static IP config rejected; falling back to DHCP");
+            Serial.print("Current Wi-Fi mode: ");
+            Serial.println((int)WiFi.getMode());
         }
     }
-    else
+    else if (useStaticIP)
     {
-        // Use DHCP for the mobile hotspot, whose subnet is usually different.
-        WiFi.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0),
-                    IPAddress(0, 0, 0, 0));
+        Serial.println("Static IP and gateway are on different subnets; falling back to DHCP");
     }
 
-    WiFi.begin(ssid, password);
-    unsigned long attemptStarted = millis();
-    bool ledState = HIGH;
+    // Explicitly clear any prior static-IP settings before each DHCP attempt.
+    if (!staticConfigApplied &&
+        !WiFi.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0),
+                     IPAddress(0, 0, 0, 0)))
+    {
+        Serial.print("WARNING: DHCP config request was rejected; Wi-Fi mode is ");
+        Serial.println((int)WiFi.getMode());
+    }
+    else if (!staticConfigApplied)
+    {
+        Serial.println(useStaticIP ? "Using DHCP fallback for router" : "Using DHCP for hotspot");
+    }
 
-    while (WiFi.status() != WL_CONNECTED && millis() - attemptStarted < 12000)
+    Serial.println("Starting association...");
+    WiFi.begin(ssid, password);
+
+    const unsigned long attemptStarted = millis();
+    bool ledState = HIGH;
+    wl_status_t lastStatus = WiFi.status();
+
+    while (WiFi.status() != WL_CONNECTED && millis() - attemptStarted < 20000UL)
     {
         digitalWrite(WIFI_LED_PIN, ledState);
         ledState = !ledState;
-        delay(300);
+        delay(250);
         yield();
+
+        wl_status_t currentStatus = WiFi.status();
+        if (currentStatus != lastStatus)
+        {
+            Serial.print("Wi-Fi status changed: ");
+            Serial.println((int)currentStatus);
+            lastStatus = currentStatus;
+        }
     }
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        Serial.println("Wi-Fi association successful.");
+        Serial.print("SSID: ");
+        Serial.println(WiFi.SSID());
+        Serial.print("IP: ");
+        Serial.println(WiFi.localIP());
+        Serial.print("Gateway: ");
+        Serial.println(WiFi.gatewayIP());
+        Serial.print("Subnet: ");
+        Serial.println(WiFi.subnetMask());
+        Serial.print("RSSI: ");
+        Serial.print(WiFi.RSSI());
+        Serial.println(" dBm");
+        return;
+    }
+
+    Serial.print("Wi-Fi connection failed; status ");
+    Serial.print((int)WiFi.status());
+    Serial.print(": ");
+    switch (WiFi.status())
+    {
+    case WL_NO_SSID_AVAIL:
+        Serial.println("SSID not found. Check exact SSID, range and 2.4 GHz.");
+        break;
+    case WL_CONNECT_FAILED:
+        Serial.println("Connection rejected. Check password and security mode.");
+        break;
+    case WL_CONNECTION_LOST:
+        Serial.println("Connection lost during association.");
+        break;
+    case WL_DISCONNECTED:
+        Serial.println("Disconnected/association timed out. Check SSID, password, 2.4 GHz and WPA mode.");
+        break;
+    default:
+        Serial.println("See ESP8266 Wi-Fi status code.");
+        break;
+    }
+
+    // Explicitly report that a static-IP problem and an authentication/
+    // association problem are different; changing the IP cannot fix a bad key.
+    if (useStaticIP && staticConfigApplied)
+        Serial.println("Static IP was accepted; failure is at Wi-Fi association, not IP addressing.");
 }
 
 void connectWiFi()
 {
-    WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
+    Serial.print("Free heap before Wi-Fi: ");
+    Serial.print(ESP.getFreeHeap());
+    Serial.print(" bytes; largest block: ");
+    Serial.println(ESP.getMaxFreeBlockSize());
+
+    if (!WiFi.mode(WIFI_STA))
+    {
+        Serial.print("ERROR: Could not set station mode; current mode is ");
+        Serial.println((int)WiFi.getMode());
+        return;
+    }
+
+    if (!WiFi.setAutoReconnect(true))
+    {
+        Serial.println("WARNING: Could not enable automatic Wi-Fi reconnect");
+    }
+    WiFi.setSleepMode(WIFI_NONE_SLEEP);
+    Serial.print("Station mode ready: ");
+    Serial.println((int)WiFi.getMode());
 
     // Keep trying both networks until one connects.
     while (WiFi.status() != WL_CONNECTED)
@@ -775,97 +1232,62 @@ void sendBlockedResponse(
 // FORWARD DNS REQUEST
 // ============================================================
 
-void forwardDNSRequest(
-    uint8_t *request,
-    int requestLength,
-    IPAddress clientIP,
-    uint16_t clientPort)
+void forwardDNSRequest(uint8_t *request, int requestLength, IPAddress clientIP, uint16_t clientPort)
 {
-    // Save original transaction ID
-
-    uint8_t originalID0 =
-        request[0];
-
-    uint8_t originalID1 =
-        request[1];
-
-    // Create new transaction ID
-
-    uint16_t newID =
-        (uint16_t)(micros() & 0xFFFF);
-
-    request[0] =
-        (newID >> 8) & 0xFF;
-
-    request[1] =
-        newID & 0xFF;
-
-    // Send to upstream DNS
-
-    upstreamDNSUDP.beginPacket(
-        upstreamDNS,
-        53);
-
-    upstreamDNSUDP.write(
-        request,
-        requestLength);
-
-    upstreamDNSUDP.endPacket();
-
-    // Wait for response
-
-    unsigned long start =
-        millis();
-
-    while (
-        millis() - start < 2000)
+    if (requestLength < 12 || requestLength > 512)
+        return;
+    uint8_t original0 = request[0], original1 = request[1];
+    uint16_t id = (uint16_t)(micros() & 0xFFFF);
+    request[0] = id >> 8;
+    request[1] = id & 0xFF;
+    IPAddress servers[2] = {upstreamDNS, upstreamDNSBackup};
+    uint8_t response[512];
+    for (uint8_t s = 0; s < 2; s++)
     {
-        int responseSize =
-            upstreamDNSUDP.parsePacket();
-
-        if (responseSize > 0)
+        if (s)
+            upstreamFallbacks++;
+        while (upstreamDNSUDP.parsePacket() > 0)
         {
-            uint8_t response[512];
-
-            int responseLength =
-                upstreamDNSUDP.read(
-                    response,
-                    sizeof(response));
-
-            if (
-                responseLength <= 0)
-            {
-                return;
-            }
-
-            // Restore client's transaction ID
-
-            response[0] =
-                originalID0;
-
-            response[1] =
-                originalID1;
-
-            // Send response to client
-
-            clientDNS.beginPacket(
-                clientIP,
-                clientPort);
-
-            clientDNS.write(
-                response,
-                responseLength);
-
-            clientDNS.endPacket();
-
-            return;
+            uint8_t trash[512];
+            while (upstreamDNSUDP.available())
+                upstreamDNSUDP.read(trash, sizeof(trash));
         }
-
-        yield();
+        if (!upstreamDNSUDP.beginPacket(servers[s], 53))
+            continue;
+        upstreamDNSUDP.write(request, requestLength);
+        if (!upstreamDNSUDP.endPacket())
+            continue;
+        unsigned long started = millis();
+        while (millis() - started < 850)
+        {
+            int n = upstreamDNSUDP.parsePacket();
+            if (n > 0)
+            {
+                int got = upstreamDNSUDP.read(response, sizeof(response));
+                if (got >= 12 && response[0] == request[0] && response[1] == request[1] && (response[2] & 0x80))
+                {
+                    response[0] = original0;
+                    response[1] = original1;
+                    String key = makeCacheKey(request, requestLength);
+                    cacheStore(key, response, got);
+                    clientDNS.beginPacket(clientIP, clientPort);
+                    clientDNS.write(response, got);
+                    clientDNS.endPacket();
+                    return;
+                }
+            }
+            yield();
+        }
     }
-
-    Serial.println(
-        "ERROR: Upstream DNS timeout");
+    upstreamFailures++;
+    request[0] = original0;
+    request[1] = original1;
+    request[2] = (request[2] & 0x7F) | 0x80;
+    request[3] = (request[3] & 0xF0) | 0x02;
+    request[6] = request[7] = request[8] = request[9] = request[10] = request[11] = 0;
+    clientDNS.beginPacket(clientIP, clientPort);
+    clientDNS.write(request, requestLength);
+    clientDNS.endPacket();
 }
 
 // ============================================================
@@ -924,11 +1346,17 @@ void processDNS()
 
     Serial.println(domain);
 
+    bool pausedNow = blockingPaused && (pauseUntil == 0 || (long)(millis() - pauseUntil) < 0);
+    bool scheduled = scheduledBlock(domain, clientIP);
+    bool shouldBlock = !pausedNow && !isAllowlisted(domain) && (isBlocked(domain) || scheduled);
+    updateClientStats(clientIP, shouldBlock);
+
     // Check blocklist
 
-    if (isBlocked(domain))
+    if (shouldBlock)
     {
         blockedQueries++;
+        dailyBlocked++;
 
         Serial.print(
             ">>> BLOCKED: ");
@@ -951,6 +1379,7 @@ void processDNS()
     else
     {
         allowedQueries++;
+        dailyAllowed++;
 
         Serial.print(
             ">>> ALLOWED: ");
@@ -964,11 +1393,11 @@ void processDNS()
             false,
             clientIP);
 
-        forwardDNSRequest(
-            packet,
-            length,
-            clientIP,
-            clientPort);
+        String cacheKey = makeCacheKey(packet, length);
+        if (!cacheLookup(cacheKey, clientIP, clientPort, packet))
+        {
+            forwardDNSRequest(packet, length, clientIP, clientPort);
+        }
     }
 }
 
@@ -1083,9 +1512,16 @@ void handleStats()
 {
     FSInfo fs;
     const bool fsOK = LittleFS.info(fs);
+    uint32_t freeHeap = ESP.getFreeHeap();
+    uint32_t largestFreeBlock = ESP.getMaxFreeBlockSize();
+    uint8_t heapFragmentation = 0;
+    ESP.getHeapStats(&freeHeap, &largestFreeBlock, &heapFragmentation);
+    const uint32_t ramUsed = ESP8266_RAM_BUDGET_BYTES -
+                             (freeHeap < ESP8266_RAM_BUDGET_BYTES ? freeHeap : ESP8266_RAM_BUDGET_BYTES);
+    const uint32_t ramUsedPercent = (ramUsed * 100UL) / ESP8266_RAM_BUDGET_BYTES;
 
     String j;
-    j.reserve(460);
+    j.reserve(560);
     j += "{\"blocked\":" + String(blockedQueries);
     j += ",\"allowed\":" + String(allowedQueries);
     j += ",\"total\":" + String(totalQueries);
@@ -1097,10 +1533,22 @@ void handleStats()
     j += ",\"flash\":" + String(ESP.getFlashChipRealSize());
     j += ",\"fw\":" + String(ESP.getSketchSize());
     j += ",\"ota\":" + String(ESP.getFreeSketchSpace());
-    j += ",\"heap\":" + String(ESP.getFreeHeap());
-    j += ",\"maxBlock\":" + String(ESP.getMaxFreeBlockSize());
+    j += ",\"heap\":" + String(freeHeap);
+    j += ",\"maxBlock\":" + String(largestFreeBlock);
+    j += ",\"heapFrag\":" + String(heapFragmentation);
+    j += ",\"ramTotal\":" + String(ESP8266_RAM_BUDGET_BYTES);
+    j += ",\"ramUsed\":" + String(ramUsed);
+    j += ",\"ramUsedPct\":" + String(ramUsedPercent);
     j += ",\"fsTotal\":" + String(fsOK ? fs.totalBytes : 0);
     j += ",\"fsUsed\":" + String(fsOK ? fs.usedBytes : 0);
+    j += ",\"dailyBlocked\":" + String(dailyBlocked);
+    j += ",\"dailyAllowed\":" + String(dailyAllowed);
+    j += ",\"cacheHits\":" + String(cacheHits);
+    j += ",\"cacheMisses\":" + String(cacheMisses);
+    j += ",\"upstreamFallbacks\":" + String(upstreamFallbacks);
+    j += ",\"upstreamFailures\":" + String(upstreamFailures);
+    j += ",\"paused\":" + String(blockingPaused ? "true" : "false");
+    j += ",\"epoch\":" + String((unsigned long)time(nullptr));
     j += ",\"custom\":" + String(blockCount);
     j += ",\"customMax\":" + String(MAX_BLOCKED_DOMAINS);
     j += ",\"autoReady\":" + String(autoBlocklistReady ? "true" : "false");
@@ -1138,6 +1586,8 @@ void handleBlocklistApi()
 
 void handleRoot()
 {
+    server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    server.sendHeader("Pragma", "no-cache");
     server.send_P(
         200,
         "text/html",
@@ -1310,6 +1760,9 @@ void setup()
     else
     {
         loadCustomBlocklist();
+        loadAllowlist();
+        loadStats();
+        loadSchedule();
         Serial.print(
             "Loaded custom blocked domains: ");
         Serial.println(blockCount);
@@ -1351,6 +1804,19 @@ void setup()
     // Wi-Fi
     // --------------------------------------------------------
 
+    stationDisconnectHandler = WiFi.onStationModeDisconnected(
+        [](const WiFiEventStationModeDisconnected &event)
+        {
+            if (event.reason == WIFI_DISCONNECT_REASON_AUTH_LEAVE ||
+                event.reason == WIFI_DISCONNECT_REASON_ASSOC_LEAVE)
+            {
+                return;
+            }
+
+            Serial.print("Wi-Fi disconnect reason code: ");
+            Serial.println((int)event.reason);
+        });
+
     connectWiFi();
 
     if (
@@ -1361,6 +1827,10 @@ void setup()
 
         return;
     }
+
+    configTime(19800, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+    MDNS.begin("dnsblock");
+    MDNS.addService("http", "tcp", 80);
 
     // --------------------------------------------------------
     // Start client DNS socket
@@ -1407,10 +1877,8 @@ void setup()
         HTTP_GET,
         handleRoot);
 
-    server.on(
-        "/add",
-        HTTP_GET,
-        handleAdd);
+    server.on("/add", HTTP_GET, handleAdd);
+    server.on("/add", HTTP_POST, handleAdd);
 
     server.on(
         "/remove",
@@ -1433,6 +1901,19 @@ void setup()
         "/api/blocklist",
         HTTP_GET,
         handleBlocklistApi);
+    server.on("/api/clients", HTTP_GET, []()
+              {
+        String j = "[";
+        bool first = true;
+        for (int i = 0; i < 16; i++) {
+            if (clientStats[i].used) {
+                if (!first) j += ",";
+                first = false;
+                j += "{\"ip\":\"" + clientStats[i].ip.toString() + "\",\"total\":" + String(clientStats[i].total) + ",\"blocked\":" + String(clientStats[i].blocked) + "}";
+            }
+        }
+        j += "]";
+        server.send(200, "application/json", j); });
 
     // DNS terminal API
 
@@ -1450,6 +1931,43 @@ void setup()
     // Start web server
     // --------------------------------------------------------
 
+    httpUpdater.setup(&server, OTA_PATH, OTA_USER, OTA_PASSWORD);
+    server.on("/api/allow", HTTP_POST, []()
+              {
+        if (!server.hasArg("domain") || !addAllowDomain(server.arg("domain")))
+            server.send(400, "application/json", "{\"success\":false}");
+        else
+            server.send(200, "application/json", "{\"success\":true}"); });
+    server.on("/api/schedule", HTTP_GET, []()
+              {
+        String j = "{\"enabled\":" + String(scheduleEnabled ? "true" : "false") + ",\"client\":\"" + jsonEscape(scheduledClient.c_str()) + "\",\"domain\":\"" + jsonEscape(scheduledDomain.c_str()) + "\",\"start\":" + String(scheduleStartHour) + ",\"end\":" + String(scheduleEndHour) + "}";
+        server.send(200, "application/json", j); });
+    server.on("/api/schedule", HTTP_POST, []()
+              {
+        if(!server.hasArg("domain") || !server.hasArg("start") || !server.hasArg("end")) {
+            server.send(400,"application/json","{\"success\":false}"); return;
+        }
+        int sh=server.arg("start").toInt(), eh=server.arg("end").toInt();
+        if(sh<0||sh>23||eh<0||eh>23) {server.send(400,"text/plain","Hours must be 0-23");return;}
+        scheduledDomain=normalizeDomain(server.arg("domain"));
+        scheduledClient=server.arg("client");
+        scheduleStartHour=sh; scheduleEndHour=eh; scheduleEnabled=scheduledDomain.length()>0;
+        saveSchedule(); clearDNSCache();
+        server.send(200,"application/json","{\"success\":true}"); });
+    server.on("/api/schedule/disable", HTTP_POST, []()
+              {
+        scheduleEnabled=false; saveSchedule(); clearDNSCache();
+        server.send(200,"application/json","{\"success\":true}"); });
+    server.on("/api/pause", HTTP_POST, []()
+              {
+        blockingPaused = true;
+        pauseUntil = server.hasArg("minutes") ? millis() + (unsigned long)server.arg("minutes").toInt() * 60000UL : 0;
+        clearDNSCache();
+        server.send(200, "application/json", "{\"paused\":true}"); });
+    server.on("/api/resume", HTTP_POST, []()
+              {
+        blockingPaused = false; pauseUntil = 0; clearDNSCache();
+        server.send(200, "application/json", "{\"paused\":false}"); });
     server.begin();
 
     Serial.println(
@@ -1525,6 +2043,27 @@ void loop()
     // --------------------------------------------------------
 
     server.handleClient();
-
+    MDNS.update();
+    if (blockingPaused && pauseUntil && (long)(millis() - pauseUntil) >= 0)
+    {
+        blockingPaused = false;
+        pauseUntil = 0;
+        clearDNSCache();
+    }
+    if (millis() - lastStatsSave > 300000UL)
+        saveStats();
+    time_t clockNow = time(nullptr);
+    if (clockNow > 1700000000)
+    {
+        struct tm *lt = localtime(&clockNow);
+        if (lt && savedDay != -1 && savedDay != lt->tm_yday)
+        {
+            dailyAllowed = 0;
+            dailyBlocked = 0;
+            saveStats();
+        }
+        if (lt)
+            savedDay = lt->tm_yday;
+    }
     yield();
 }
