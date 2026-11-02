@@ -11,6 +11,7 @@ This project is for people who want to learn about DNS filtering or manage their
 - Also blocks subdomains of a blocked domain. For example, blocking `example.com` blocks `ads.example.com`.
 - Forwards other DNS requests to Cloudflare DNS (`1.1.1.1`).
 - Hosts a web dashboard with request counts, a live log, and custom blocklist controls.
+- Shows the source client IP beside each DNS log entry; the live-log search matches both domains and client IP addresses.
 - Saves custom blocked domains in the ESP8266's LittleFS flash storage.
 
 ## Screenshots
@@ -41,6 +42,8 @@ flowchart LR
     Device -->|"Normal web or app traffic"| Router["Wi-Fi router"] --> Internet["Internet"]
 ```
 
+The live log records the source IP address seen by the ESP8266 for each DNS request. It does not resolve IP addresses to device names or MAC addresses.
+
 Only DNS lookups pass through the ESP8266. After a domain is resolved, the device connects to the website or service through the router as usual.
 
 ## What you need
@@ -52,12 +55,12 @@ Only DNS lookups pass through the ESP8266. After a domain is resolved, the devic
 
 ## Network settings
 
-The current defaults in [`src/main.cpp`](src/main.cpp) are:
+The current defaults in [`src/main.cpp`](src/main.cpp) are (adjust them if your router uses a different subnet):
 
 | Setting | Default |
 | --- | --- |
-| ESP8266 address on the router network | `192.168.0.50` |
-| Router / gateway | `192.168.0.1` |
+| ESP8266 address on the router network | `192.168.31.50` |
+| Router / gateway | `192.168.31.1` |
 | Network mask | `255.255.255.0` |
 | DNS server used for lookups | `1.1.1.1` |
 | DNS port | UDP `53` |
@@ -100,8 +103,8 @@ For a single device, open its Wi-Fi network settings and set its DNS server to t
 
 | Device setting | Example |
 | --- | --- |
-| DNS server | `192.168.0.50` |
-| Gateway | Your router's address, such as `192.168.0.1` |
+| DNS server | `192.168.31.50` |
+| Gateway | Your router's address, such as `192.168.31.1` |
 
 For network-wide use, configure your router's DHCP/DNS settings to give clients the ESP8266 address as their DNS server, if the router supports that. Do not configure the router's own upstream DNS as the ESP8266 unless the router supports the required DNS forwarding setup.
 

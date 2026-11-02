@@ -85,7 +85,7 @@ button{font:inherit;cursor:pointer}
     <button class="chip on" data-f="all">All</button>
     <button class="chip" data-f="blocked">Blocked</button>
     <button class="chip" data-f="allowed">Allowed</button>
-    <input type="text" id="q" placeholder="Filter domains…">
+    <input type="text" id="q" placeholder="Filter domain or device IP…">
   </div>
   <div class="bar">
     <button class="btn" id="pause">Pause</button>
@@ -182,12 +182,12 @@ async function loadStats(){
 // logs
 function renderLogs(){
   const q=$('#q').value.trim().toLowerCase();
-  const v=logs.filter(l=>(filter==='all'||(filter==='blocked')===l.blocked)&&(!q||l.domain.includes(q)));
+  const v=logs.filter(l=>(filter==='all'||(filter==='blocked')===l.blocked)&&(!q||l.domain.toLowerCase().includes(q)||((l.client||'').toLowerCase().includes(q))));
   $('#logInfo').textContent=v.length+' / '+logs.length+' shown';
   const t=$('#term');
   if(!v.length){t.innerHTML='<div class="empty">'+(logs.length?'No matches':'Waiting for DNS requests…')+'</div>';return}
   const stick=t.scrollTop+t.clientHeight>=t.scrollHeight-30;
-  t.innerHTML=v.map(l=>'<div class="ln"><span class="t">'+fmtT(l.time)+'</span> '+(l.blocked?'<span class="b">[BLOCKED]</span>':'<span class="a">[ALLOWED]</span>')+' '+esc(l.domain)+'</div>').join('');
+  t.innerHTML=v.map(l=>'<div class="ln"><span class="t">'+fmtT(l.time)+'</span> '+(l.blocked?'<span class="b">[BLOCKED]</span>':'<span class="a">[ALLOWED]</span>')+' '+esc(l.domain)+' <span class="t">from '+esc(l.client||'unknown')+'</span></div>').join('');
   if(stick)t.scrollTop=t.scrollHeight;
 }
 async function loadLogs(){

@@ -178,6 +178,7 @@ struct DNSLog
 {
     unsigned long time;
     bool blocked;
+    char clientIP[16];
     char domain[MAX_LOG_DOMAIN_LENGTH];
 };
 
@@ -191,7 +192,8 @@ int logCount = 0;
 
 void addDNSLog(
     const String &domain,
-    bool blocked)
+    bool blocked,
+    const IPAddress &clientIP)
 {
     // If already full, shift everything left.
     // This removes the oldest log.
@@ -208,6 +210,9 @@ void addDNSLog(
 
     dnsLogs[logCount].time = millis();
     dnsLogs[logCount].blocked = blocked;
+    clientIP.toString().toCharArray(
+        dnsLogs[logCount].clientIP,
+        sizeof(dnsLogs[logCount].clientIP));
 
     String cleanDomain = domain;
 
@@ -935,7 +940,8 @@ void processDNS()
 
         addDNSLog(
             domain,
-            true);
+            true,
+            clientIP);
 
         sendBlockedResponse(
             packet,
@@ -956,7 +962,8 @@ void processDNS()
 
         addDNSLog(
             domain,
-            false);
+            false,
+            clientIP);
 
         forwardDNSRequest(
             packet,
@@ -1038,6 +1045,10 @@ void handleLogs()
         json +=
             jsonEscape(
                 dnsLogs[i].domain);
+        json += "\"";
+
+        json += ",\"client\":\"";
+        json += jsonEscape(dnsLogs[i].clientIP);
         json += "\"";
 
         json += "}";
