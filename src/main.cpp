@@ -188,7 +188,7 @@ String allowlist[100];
 uint8_t allowCount = 0;
 
 // Keep the response cache bounded to leave heap for the ESP8266 Wi-Fi stack.
-#define DNS_CACHE_ENTRIES 25
+#define DNS_CACHE_ENTRIES 10
 #define DNS_CACHE_PACKET_MAX 256
 #define ESP8266_RAM_BUDGET_BYTES 81920UL
 struct DNSCacheEntry
